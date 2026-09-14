@@ -9,6 +9,9 @@ describe:批采项目打包 + SFTP 自动部署
      因此部署全部依靠 SFTP 文件操作完成：
      上传到 dist_new_时间戳 -> 改名切换 -> 保留 dist_bak_时间戳 供回滚。
      实测服务器不支持并发连接（并发写入会超时卡死），所以上传固定单连接串行。
+
+     用户端（fashionUser）正式环境分大陆站和香港站，两者在不同服务器上，
+     打包产物也分开（dist-cn / dist-hk），避免互相覆盖。
 """
 import json
 import os
@@ -26,11 +29,28 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "deploy_config.json")
 
 # 项目本地路径 与 服务器站点目录名 的对应关系
+# sites: 正式环境下需要分站发布的项目（目前只有用户端），每个站点自带服务器、打包命令和产物目录
 PROJECTS = {
     "1": {"name": "fashion", "path": r"E:\批采系统代码\fashion\splist", "remote": "adm"},
-    "2": {"name": "fashionUser", "path": r"E:\批采系统代码\fashionUser\splist", "remote": "user"},
+    "2": {
+        "name": "fashionUser",
+        "path": r"E:\批采系统代码\fashionUser\splist",
+        "remote": "user",
+        "sites": [
+            {"label": "大陆站", "server": "prod_cn", "remote": "user",
+             "dist": "dist-cn", "build_cmd": "npm run build:prod:cn"},
+            {"label": "香港站", "server": "prod_hk", "remote": "user",
+             "dist": "dist-hk", "build_cmd": "npm run build:prod:hk"},
+        ],
+    },
     "3": {"name": "suppliers", "path": r"E:\批采系统代码\suppliers\splist", "remote": "supply"},
     "4": {"name": "sale", "path": r"E:\批采系统代码\sale\splist", "remote": "sale"},
+}
+
+# 环境 -> 默认服务器（不分站的项目走这个）
+ENVS = {
+    "1": {"key": "test", "label": "测试环境", "server": "test"},
+    "2": {"key": "prod", "label": "正式环境", "server": "prod_cn"},
 }
 
 BACKUP_KEEP = 1  # 服务器上保留几份历史备份
@@ -74,37 +94,84 @@ def pick_projects():
     return picked
 
 
-def pick_server(config):
+def pick_env():
     print("\n请选择环境:")
-    options = list(config.keys())
-    for i, key in enumerate(options, 1):
-        cfg = config[key]
-        target = cfg.get("host") or "（未配置）"
-        print("  [%d] %-8s %s" % (i, cfg.get("label", key), target))
-    idx = ask("请输入选项: ", [str(i) for i in range(1, len(options) + 1)])
-    key = options[int(idx) - 1]
-    cfg = config[key]
-    if not cfg.get("host"):
-        sys.exit("环境 [%s] 尚未在 deploy_config.json 中配置服务器信息" % cfg.get("label", key))
-    if key == "prod":
-        print("\n!! 即将操作【正式环境】: %s" % cfg["host"])
+    for key, env in ENVS.items():
+        print("  [%s] %s" % (key, env["label"]))
+    return ENVS[ask("请输入选项: ", list(ENVS.keys()))]
+
+
+def pick_sites(project):
+    """正式环境下选择要发布的站点，可多选"""
+    sites = project["sites"]
+    print("\n%s 分站发布，请选择站点:" % project["name"])
+    for i, site in enumerate(sites, 1):
+        print("  [%d] %s" % (i, site["label"]))
+    print("  [A] 全部")
+    raw = input("请选择 (空格隔开): ").strip().upper()
+    if raw == "A":
+        return list(sites)
+    picked = [sites[int(r) - 1] for r in raw.split() if r.isdigit() and 1 <= int(r) <= len(sites)]
+    if not picked:
+        sys.exit("未选择任何站点")
+    return picked
+
+
+def build_tasks(projects, env, config, need_server):
+    """把「项目 × 站点」展开成部署任务；不分站的项目走环境默认服务器"""
+    tasks = []
+    for project in projects:
+        sites = project.get("sites") if env["key"] == "prod" else None
+        variants = pick_sites(project) if sites else [None]
+        for site in variants:
+            server_key = site["server"] if site else env["server"]
+            server = config.get(server_key)
+            if server is None:
+                sys.exit("deploy_config.json 中缺少环境配置: %s" % server_key)
+            if need_server and not server.get("host"):
+                sys.exit("环境 [%s] 尚未在 deploy_config.json 中配置服务器信息"
+                         % server.get("label", server_key))
+            tasks.append({
+                "project": project,
+                "title": "%s (%s)" % (project["name"], site["label"]) if site else project["name"],
+                "build_cmd": site["build_cmd"] if site else server["build_cmd"],
+                "dist": site["dist"] if site else "dist",
+                "remote": site["remote"] if site else project["remote"],
+                "server_key": server_key,
+                "server": server,
+            })
+    return tasks
+
+
+def confirm_tasks(tasks, env, action):
+    print("\n%s\n本次操作清单:" % LINE)
+    for task in tasks:
+        if action == "2":
+            print("  %-24s 打包 %s -> %s" % (task["title"], task["build_cmd"], task["dist"]))
+        else:
+            server = task["server"]
+            target = posixpath.join(server["root"], task["remote"])
+            print("  %-24s %s %s:%s" % (task["title"], server["label"], server["host"], target))
+    print(LINE)
+    if env["key"] == "prod" and action != "2":
+        print("!! 即将操作【正式环境】")
         if input("确认请输入大写 YES: ").strip() != "YES":
             sys.exit("已取消")
-    return key, cfg
 
 
 # --------------------------------------------------------------------------- 打包
 
 
-def build(project, build_cmd):
-    print("\n%s\n打包: %s | %s\n%s" % (LINE, project["name"], build_cmd, LINE))
-    dist_path = os.path.join(project["path"], "dist")
+def build(task):
+    project, build_cmd = task["project"], task["build_cmd"]
+    print("\n%s\n打包: %s | %s\n%s" % (LINE, task["title"], build_cmd, LINE))
+    dist_path = os.path.join(project["path"], task["dist"])
     if os.path.exists(dist_path):
-        print(">>> 清理旧的 dist 目录")
+        print(">>> 清理旧的 %s 目录" % task["dist"])
         shutil.rmtree(dist_path)
     subprocess.run(build_cmd, cwd=project["path"], shell=True, check=True)
     if not os.path.exists(os.path.join(dist_path, "index.html")):
-        raise RuntimeError("打包结束但未生成 dist/index.html")
+        raise RuntimeError("打包结束但未生成 %s/index.html" % task["dist"])
     print("--- 打包完成 ---")
 
 
@@ -212,20 +279,21 @@ def clean_backups(sftp, site_dir, keep):
         sftp.rmtree(posixpath.join(site_dir, name))
 
 
-def deploy(sftp, project, server, stamp):
-    dist_path = os.path.join(project["path"], "dist")
+def deploy(sftp, task, stamp):
+    project, server = task["project"], task["server"]
+    dist_path = os.path.join(project["path"], task["dist"])
     if not os.path.exists(os.path.join(dist_path, "index.html")):
-        raise RuntimeError("本地未找到 %s\\dist\\index.html，请先打包" % project["path"])
+        raise RuntimeError("本地未找到 %s\\%s\\index.html，请先打包" % (project["path"], task["dist"]))
 
-    site_dir = posixpath.join(server["root"], project["remote"])
+    site_dir = posixpath.join(server["root"], task["remote"])
     live = posixpath.join(site_dir, "dist")
     staging = posixpath.join(site_dir, "dist_new_%s" % stamp)
     backup = posixpath.join(site_dir, "dist_bak_%s" % stamp)
 
     mtime = datetime.fromtimestamp(os.path.getmtime(dist_path)).strftime("%m-%d %H:%M")
     dirs, files, total = scan_local(dist_path)
-    print("\n%s\n部署: %s -> %s\n%s" % (LINE, project["name"], site_dir, LINE))
-    print(">>> 本地 dist: %d 个文件 / %s / 生成于 %s" % (len(files), human(total), mtime))
+    print("\n%s\n部署: %s -> %s:%s\n%s" % (LINE, task["title"], server["host"], site_dir, LINE))
+    print(">>> 本地 %s: %d 个文件 / %s / 生成于 %s" % (task["dist"], len(files), human(total), mtime))
 
     if not sftp.exists(site_dir):
         raise RuntimeError("服务器上不存在站点目录: %s" % site_dir)
@@ -266,7 +334,7 @@ def deploy(sftp, project, server, stamp):
             sftp.client.rename(backup, live)
             print("    切换失败，已还原为原版本")
         raise
-    print("--- [成功] %s 已上线，备份: %s ---" % (project["name"], posixpath.basename(backup) if had_live else "无"))
+    print("--- [成功] %s 已上线，备份: %s ---" % (task["title"], posixpath.basename(backup) if had_live else "无"))
 
     clean_backups(sftp, site_dir, BACKUP_KEEP)
 
@@ -274,15 +342,15 @@ def deploy(sftp, project, server, stamp):
 # --------------------------------------------------------------------------- 回滚
 
 
-def rollback(sftp, project, server):
-    site_dir = posixpath.join(server["root"], project["remote"])
+def rollback(sftp, task):
+    site_dir = posixpath.join(task["server"]["root"], task["remote"])
     live = posixpath.join(site_dir, "dist")
     backups = sorted([n for n in sftp.client.listdir(site_dir) if n.startswith("dist_bak_")], reverse=True)
     if not backups:
-        print("--- %s 没有可用备份 ---" % project["name"])
+        print("--- %s 没有可用备份 ---" % task["title"])
         return
 
-    print("\n%s 可用备份:" % project["name"])
+    print("\n%s 可用备份:" % task["title"])
     for i, name in enumerate(backups, 1):
         print("  [%d] %s" % (i, name))
     idx = ask("请选择要恢复的备份: ", [str(i) for i in range(1, len(backups) + 1)])
@@ -292,7 +360,7 @@ def rollback(sftp, project, server):
     if sftp.exists(live):
         sftp.client.rename(live, posixpath.join(site_dir, "dist_bak_%s" % stamp))
     sftp.client.rename(chosen, live)
-    print("--- [成功] %s 已回滚到 %s ---" % (project["name"], backups[int(idx) - 1]))
+    print("--- [成功] %s 已回滚到 %s ---" % (task["title"], backups[int(idx) - 1]))
 
 
 # --------------------------------------------------------------------------- 入口
@@ -313,50 +381,48 @@ def main():
     if not projects:
         sys.exit("未选择任何项目")
 
-    server = None
-    if action != "2":
-        _, server = pick_server(config)
-    build_cmd = None
-    if action in ("1", "2"):
-        if server:
-            build_cmd = server["build_cmd"]
-        else:
-            print("\n请选择打包环境:")
-            print("  [1] 测试 (npm run build:dev)")
-            print("  [2] 生产 (npm run build:prod)")
-            build_cmd = "npm run build:dev" if ask("请输入选项: ", ["1", "2"]) == "1" else "npm run build:prod"
-        print("\n打包命令: %s" % build_cmd)
+    env = pick_env()
+    tasks = build_tasks(projects, env, config, need_server=action != "2")
+    if action in ("1", "2") and len(tasks) == 1:
+        print("\n打包命令: %s" % tasks[0]["build_cmd"])
         typed = input("直接回车使用，或输入其它命令: ").strip()
         if typed:
-            build_cmd = typed
+            tasks[0]["build_cmd"] = typed
+    confirm_tasks(tasks, env, action)
 
-    sftp = None
-    if action != "2":
-        print("\n>>> 连接 %s ..." % server["host"])
-        sftp = Sftp(server)
-        sftp.connect()
-        print("--- 连接成功 ---")
+    sessions = {}
+
+    def session_for(task):
+        """同一台服务器只连一次；服务器不支持并发，连接始终串行使用"""
+        key = task["server_key"]
+        if key not in sessions:
+            print("\n>>> 连接 %s (%s) ..." % (task["server"]["host"], task["server"]["label"]))
+            sftp = Sftp(task["server"])
+            sftp.connect()
+            sessions[key] = sftp
+            print("--- 连接成功 ---")
+        return sessions[key]
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     succeeded, failed = [], []
     try:
-        for project in projects:
+        for task in tasks:
             try:
                 if action in ("1", "2"):
-                    build(project, build_cmd)
+                    build(task)
                 if action in ("1", "3"):
-                    deploy(sftp, project, server, stamp)
+                    deploy(session_for(task), task, stamp)
                 if action == "4":
-                    rollback(sftp, project, server)
-                succeeded.append(project["name"])
+                    rollback(session_for(task), task)
+                succeeded.append(task["title"])
             except subprocess.CalledProcessError:
-                failed.append(project["name"])
-                print("--- [失败] %s 打包出错 ---" % project["name"])
+                failed.append(task["title"])
+                print("--- [失败] %s 打包出错 ---" % task["title"])
             except Exception as e:
-                failed.append(project["name"])
-                print("--- [失败] %s: %s ---" % (project["name"], e))
+                failed.append(task["title"])
+                print("--- [失败] %s: %s ---" % (task["title"], e))
     finally:
-        if sftp:
+        for sftp in sessions.values():
             sftp.close()
 
     print("\n%s" % LINE)
