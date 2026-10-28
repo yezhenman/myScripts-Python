@@ -55,6 +55,8 @@ ENVS = {
 
 BACKUP_KEEP = 1  # 服务器上保留几份历史备份
 UPLOAD_RETRY = 3  # 单个文件上传失败重试次数
+# 本地打包 Node 堆上限（MB）。package.json 里 Jenkins 固定 1800，本地 Vite 易 OOM，在此覆盖。
+BUILD_NODE_HEAP_MB = 4096
 LINE = "=" * 58
 
 
@@ -162,14 +164,38 @@ def confirm_tasks(tasks, env, action):
 # --------------------------------------------------------------------------- 打包
 
 
+def resolve_build_cmd(build_cmd, project_path):
+    """展开 npm run，并把 Jenkins 固定的 vite 1800MB 堆上限改为本地值（仅改 vite 段，minify 仍 512）。"""
+    prefix = "npm run "
+    if not build_cmd.startswith(prefix):
+        return build_cmd
+    script_name = build_cmd[len(prefix):].strip()
+    pkg_path = os.path.join(project_path, "package.json")
+    if not os.path.exists(pkg_path):
+        return build_cmd
+    with open(pkg_path, "r", encoding="utf-8") as f:
+        scripts = json.load(f).get("scripts", {})
+    script_body = scripts.get(script_name)
+    if not script_body:
+        return build_cmd
+    jenkins_heap = "--max-old-space-size=1800"
+    local_heap = "--max-old-space-size=%d" % BUILD_NODE_HEAP_MB
+    if jenkins_heap not in script_body:
+        return script_body
+    return script_body.replace(jenkins_heap, local_heap, 1)
+
+
 def build(task):
     project, build_cmd = task["project"], task["build_cmd"]
+    resolved_cmd = resolve_build_cmd(build_cmd, project["path"])
     print("\n%s\n打包: %s | %s\n%s" % (LINE, task["title"], build_cmd, LINE))
+    if resolved_cmd != build_cmd:
+        print(">>> 本地堆上限 %dMB，实际执行:\n    %s" % (BUILD_NODE_HEAP_MB, resolved_cmd))
     dist_path = os.path.join(project["path"], task["dist"])
     if os.path.exists(dist_path):
         print(">>> 清理旧的 %s 目录" % task["dist"])
         shutil.rmtree(dist_path)
-    subprocess.run(build_cmd, cwd=project["path"], shell=True, check=True)
+    subprocess.run(resolved_cmd, cwd=project["path"], shell=True, check=True)
     if not os.path.exists(os.path.join(dist_path, "index.html")):
         raise RuntimeError("打包结束但未生成 %s/index.html" % task["dist"])
     print("--- 打包完成 ---")
