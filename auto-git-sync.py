@@ -7,29 +7,31 @@ describe:批采项目 Git 工具（同步测试分支 / 合并正式分支 / 推
 import os
 import subprocess
 
+from paths import batch_project
+
 # 配置项目列表（与 auto-build.py 保持一致）
 PROJECTS = {
     "1": {
         "name": "fashion",
-        "path": r"E:\批采系统代码\fashion\splist",
+        "path": batch_project("fashion", "splist"),
         "dev_branch": "fashion-develop",
         "prod_branch": "fashion-production",
     },
     "2": {
         "name": "fashionUser",
-        "path": r"E:\批采系统代码\fashionUser\splist",
+        "path": batch_project("fashionUser", "splist"),
         "dev_branch": "fashionUser-develop",
         "prod_branch": "fashionUser-production",
     },
     "3": {
         "name": "suppliers",
-        "path": r"E:\批采系统代码\suppliers\splist",
+        "path": batch_project("suppliers", "splist"),
         "dev_branch": "suppliers-dev",
         "prod_branch": "suppliers-prod",
     },
     "4": {
         "name": "sale",
-        "path": r"E:\批采系统代码\sale\splist",
+        "path": batch_project("sale", "splist"),
         "dev_branch": "sale-develop",
         "prod_branch": "sale-production",
     },

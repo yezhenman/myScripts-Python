@@ -7,10 +7,12 @@ describe:托马斯项目 Git 批量同步（本地提交 + 推送 origin）
 import os
 import subprocess
 
+from paths import valore_project
+
 # 配置项目列表（与 tms-auto-build.py 保持一致）
 PROJECTS = {
-    "1": {"name": "admin", "path": r"E:\VALORE\admin\splist"},
-    "2": {"name": "user", "path": r"E:\VALORE\user\splist"},
+    "1": {"name": "admin", "path": valore_project("admin", "splist")},
+    "2": {"name": "user", "path": valore_project("user", "splist")},
 }
 
 REMOTE = "origin"

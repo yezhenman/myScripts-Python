@@ -7,8 +7,9 @@ describe:批采项目打包 + SFTP 自动部署
 
 注意：目标服务器账号为 SFTP-only，服务端禁止执行任何命令（不能远程解压、不能 reload nginx），
      因此部署全部依靠 SFTP 文件操作完成：
-     上传到 dist_new_时间戳 -> 改名切换 -> 保留 dist_bak_时间戳 供回滚。
+     上传到 dist_new_时间戳 -> 改名切换 -> 保留 dist_bak_时间戳 供回滚（不在服务器上自动删除旧备份）。
      实测服务器不支持并发连接（并发写入会超时卡死），所以上传固定单连接串行。
+     操作「2 仅打包」且多任务时，本地打包可 2 路并行（BUILD_PARALLEL_WORKERS）；部署/回滚仍串行。
 
      用户端（fashionUser）正式环境分大陆站和香港站，两者在不同服务器上，
      打包产物也分开（dist-cn / dist-hk），避免互相覆盖。
@@ -21,9 +22,12 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
 import paramiko
+
+from paths import batch_project
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "deploy_config.json")
@@ -31,10 +35,10 @@ CONFIG_FILE = os.path.join(BASE_DIR, "deploy_config.json")
 # 项目本地路径 与 服务器站点目录名 的对应关系
 # sites: 正式环境下需要分站发布的项目（目前只有用户端），每个站点自带服务器、打包命令和产物目录
 PROJECTS = {
-    "1": {"name": "fashion", "path": r"E:\批采系统代码\fashion\splist", "remote": "adm"},
+    "1": {"name": "fashion", "path": batch_project("fashion", "splist"), "remote": "adm"},
     "2": {
         "name": "fashionUser",
-        "path": r"E:\批采系统代码\fashionUser\splist",
+        "path": batch_project("fashionUser", "splist"),
         "remote": "user",
         "sites": [
             {"label": "大陆站", "server": "prod_cn", "remote": "user",
@@ -43,8 +47,8 @@ PROJECTS = {
              "dist": "dist-hk", "build_cmd": "npm run build:prod:hk"},
         ],
     },
-    "3": {"name": "suppliers", "path": r"E:\批采系统代码\suppliers\splist", "remote": "supply"},
-    "4": {"name": "sale", "path": r"E:\批采系统代码\sale\splist", "remote": "sale"},
+    "3": {"name": "suppliers", "path": batch_project("suppliers", "splist"), "remote": "supply"},
+    "4": {"name": "sale", "path": batch_project("sale", "splist"), "remote": "sale"},
 }
 
 # 环境 -> 默认服务器（不分站的项目走这个）
@@ -53,10 +57,11 @@ ENVS = {
     "2": {"key": "prod", "label": "正式环境", "server": "prod_cn"},
 }
 
-BACKUP_KEEP = 1  # 服务器上保留几份历史备份
 UPLOAD_RETRY = 3  # 单个文件上传失败重试次数
 # 本地打包 Node 堆上限（MB）。package.json 里 Jenkins 固定 1800，本地 Vite 易 OOM，在此覆盖。
 BUILD_NODE_HEAP_MB = 4096
+# 仅操作「2 仅打包」时多任务并行数；24GB Mac 上双路 vite 较稳妥，勿用于部署。
+BUILD_PARALLEL_WORKERS = 2
 LINE = "=" * 58
 
 
@@ -201,6 +206,89 @@ def build(task):
     print("--- 打包完成 ---")
 
 
+def task_build_spec(task):
+    """供 ProcessPool 使用的可 pickle 打包参数（不含 server 等无关字段）。"""
+    return {
+        "title": task["title"],
+        "project_path": task["project"]["path"],
+        "build_cmd": task["build_cmd"],
+        "dist": task["dist"],
+    }
+
+
+def build_task_worker(spec):
+    """ProcessPool 工作进程：执行单次打包，捕获输出后一次性返回。"""
+    title = spec["title"]
+    project_path = spec["project_path"]
+    build_cmd = spec["build_cmd"]
+    dist = spec["dist"]
+    lines = []
+
+    def add(msg):
+        lines.append(msg)
+
+    try:
+        resolved_cmd = resolve_build_cmd(build_cmd, project_path)
+        add("打包: %s | %s" % (title, build_cmd))
+        if resolved_cmd != build_cmd:
+            add(">>> 本地堆上限 %dMB，实际执行:\n    %s" % (BUILD_NODE_HEAP_MB, resolved_cmd))
+        dist_path = os.path.join(project_path, dist)
+        if os.path.exists(dist_path):
+            add(">>> 清理旧的 %s 目录" % dist)
+            shutil.rmtree(dist_path)
+        proc = subprocess.run(
+            resolved_cmd, cwd=project_path, shell=True, check=True,
+            capture_output=True, text=True,
+        )
+        if proc.stdout:
+            add(proc.stdout.rstrip())
+        if proc.stderr:
+            add(proc.stderr.rstrip())
+        if not os.path.exists(os.path.join(dist_path, "index.html")):
+            return {
+                "title": title, "ok": False, "lines": lines,
+                "error": "打包结束但未生成 %s/index.html" % dist,
+            }
+        add("--- 打包完成 ---")
+        return {"title": title, "ok": True, "lines": lines, "error": None}
+    except subprocess.CalledProcessError as e:
+        if e.stdout:
+            add(e.stdout.rstrip())
+        if e.stderr:
+            add(e.stderr.rstrip())
+        return {
+            "title": title, "ok": False, "lines": lines,
+            "error": "打包命令退出码 %s" % e.returncode,
+        }
+    except Exception as e:
+        return {"title": title, "ok": False, "lines": lines, "error": str(e)}
+
+
+def build_tasks_parallel(tasks):
+    """仅打包：最多 BUILD_PARALLEL_WORKERS 路并行，完成后按任务块打印日志。"""
+    succeeded, failed = [], []
+    specs = [task_build_spec(t) for t in tasks]
+    workers = min(BUILD_PARALLEL_WORKERS, len(specs)) if specs else 1
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(build_task_worker, spec) for spec in specs]
+        for fut in as_completed(futures):
+            result = fut.result()
+            title = result["title"]
+            print("\n%s\n[%s]\n%s" % (LINE, title, LINE))
+            for line in result["lines"]:
+                print(line)
+            if result["ok"]:
+                succeeded.append(title)
+            else:
+                failed.append(title)
+                err = result.get("error")
+                if err:
+                    print("--- [失败] %s: %s ---" % (title, err))
+                else:
+                    print("--- [失败] %s 打包出错 ---" % title)
+    return succeeded, failed
+
+
 # --------------------------------------------------------------------------- SFTP
 
 
@@ -294,14 +382,14 @@ def scan_local(dist_path):
 # --------------------------------------------------------------------------- 部署
 
 
-def clean_backups(sftp, site_dir, keep):
-    backups = sorted([n for n in sftp.client.listdir(site_dir) if n.startswith("dist_bak_")])
+def clean_stale_staging(sftp, site_dir):
+    """清理残留的 dist_new_* 中间目录（上传失败或未切换留下的）。
+
+    不删除 dist_bak_*：SFTP 账号常无删除旧备份权限，且站点目录内多份备份可接受。
+    """
     stale = [n for n in sftp.client.listdir(site_dir) if n.startswith("dist_new_")]
     for name in stale:
         print(">>> 清理上次残留的中间目录: %s" % name)
-        sftp.rmtree(posixpath.join(site_dir, name))
-    for name in backups[: max(0, len(backups) - keep)]:
-        print(">>> 删除过期备份: %s" % name)
         sftp.rmtree(posixpath.join(site_dir, name))
 
 
@@ -323,7 +411,7 @@ def deploy(sftp, task, stamp):
 
     if not sftp.exists(site_dir):
         raise RuntimeError("服务器上不存在站点目录: %s" % site_dir)
-    clean_backups(sftp, site_dir, BACKUP_KEEP)
+    clean_stale_staging(sftp, site_dir)
 
     print(">>> 创建中间目录: %s" % posixpath.basename(staging))
     sftp.mkdir_p(staging)
@@ -362,7 +450,7 @@ def deploy(sftp, task, stamp):
         raise
     print("--- [成功] %s 已上线，备份: %s ---" % (task["title"], posixpath.basename(backup) if had_live else "无"))
 
-    clean_backups(sftp, site_dir, BACKUP_KEEP)
+    clean_stale_staging(sftp, site_dir)
 
 
 # --------------------------------------------------------------------------- 回滚
@@ -432,21 +520,24 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     succeeded, failed = [], []
     try:
-        for task in tasks:
-            try:
-                if action in ("1", "2"):
-                    build(task)
-                if action in ("1", "3"):
-                    deploy(session_for(task), task, stamp)
-                if action == "4":
-                    rollback(session_for(task), task)
-                succeeded.append(task["title"])
-            except subprocess.CalledProcessError:
-                failed.append(task["title"])
-                print("--- [失败] %s 打包出错 ---" % task["title"])
-            except Exception as e:
-                failed.append(task["title"])
-                print("--- [失败] %s: %s ---" % (task["title"], e))
+        if action == "2":
+            succeeded, failed = build_tasks_parallel(tasks)
+        else:
+            for task in tasks:
+                try:
+                    if action == "1":
+                        build(task)
+                    if action in ("1", "3"):
+                        deploy(session_for(task), task, stamp)
+                    if action == "4":
+                        rollback(session_for(task), task)
+                    succeeded.append(task["title"])
+                except subprocess.CalledProcessError:
+                    failed.append(task["title"])
+                    print("--- [失败] %s 打包出错 ---" % task["title"])
+                except Exception as e:
+                    failed.append(task["title"])
+                    print("--- [失败] %s: %s ---" % (task["title"], e))
     finally:
         for sftp in sessions.values():
             sftp.close()

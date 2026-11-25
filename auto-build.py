@@ -9,12 +9,14 @@ import subprocess
 import shutil
 from datetime import datetime
 
+from paths import batch_project
+
 # 1. 配置项目列表
 PROJECTS = {
-    "1": {"name": "fashion", "path": r"E:\批采系统代码\fashion\splist"},
-    "2": {"name": "fashionUser", "path": r"E:\批采系统代码\fashionUser\splist"},
-    "3": {"name": "suppliers", "path": r"E:\批采系统代码\suppliers\splist"},
-    "4": {"name": "sale", "path": r"E:\批采系统代码\sale\splist"},
+    "1": {"name": "fashion", "path": batch_project("fashion", "splist")},
+    "2": {"name": "fashionUser", "path": batch_project("fashionUser", "splist")},
+    "3": {"name": "suppliers", "path": batch_project("suppliers", "splist")},
+    "4": {"name": "sale", "path": batch_project("sale", "splist")},
 }
 
 

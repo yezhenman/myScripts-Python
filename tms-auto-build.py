@@ -9,10 +9,12 @@ import subprocess
 import shutil
 from datetime import datetime
 
+from paths import valore_project
+
 # 1. 配置项目列表
 PROJECTS = {
-    "1": {"name": "admin", "path": r"E:\VALORE\admin\splist"},
-    "2": {"name": "user", "path": r"E:\VALORE\user\splist"},
+    "1": {"name": "admin", "path": valore_project("admin", "splist")},
+    "2": {"name": "user", "path": valore_project("user", "splist")},
 }
 
 
